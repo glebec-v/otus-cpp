@@ -1,0 +1,7 @@
+build/
+*.o
+*.a
+.cache/
+.vscode/
+.opencode/
+AGENTS.md
