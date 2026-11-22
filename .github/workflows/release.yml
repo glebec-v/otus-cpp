@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - feature/github_actions
+      - 'hw*'
 
 permissions:
   contents: write
@@ -13,31 +14,77 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: true
+          fetch-depth: 0
       - run: sudo apt-get update && sudo apt-get install libboost-test-dev -y
-      - run: cmake . -DPATCH_VERSION=${{ github.run_number }} -DWITH_BOOST_TEST=ON
-      - run: cmake --build .
-      - run: cmake --build . --target test
-      - run: cmake --build . --target package
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Select projects to build
+        id: select
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.run_number }}
-          release_name: Release ${{ github.run_number }}
-          draft: false
-          prerelease: false
-      - name: Upload Release Asset
-        id: upload-release-asset
-        uses: actions/upload-release-asset@v1
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_REF_NAME}"
+          dirs=""
+          if [[ "${branch}" =~ ^hw[-_]?[a-z]*([0-9]+) ]]; then
+            # push в ветку ДЗ (hw2, hw-lesson3, ...): собираем её проект hw-lesson{N}
+            dirs="hw-lesson${BASH_REMATCH[1]}"
+          elif git cat-file -e "${BEFORE_SHA}" 2>/dev/null; then
+            # push в master: собираем проекты hw-lesson*, затронутые этим пушем (мерж ветки ДЗ)
+            dirs=$(git diff --name-only "${BEFORE_SHA}" "${HEAD_SHA}" \
+              | grep -oE '^hw-lesson[0-9]+' | sort -u || true)
+          fi
+          if [[ -z "${dirs}" ]]; then
+            # ни одно ДЗ не затронуто: собираем корневой проект (ДЗ №1)
+            dirs="."
+          fi
+          printf 'dirs<<EOF\n%s\nEOF\n' "${dirs}" >> "${GITHUB_OUTPUT}"
+      - name: Configure
+        run: |
+          set -euo pipefail
+          for src in ${{ steps.select.outputs.dirs }}; do
+            echo "==> Configure ${src}"
+            cmake -S "${src}" -B "${src}/build" -DPATCH_VERSION=${{ github.run_number }} -DWITH_BOOST_TEST=ON
+          done
+      - name: Build
+        run: |
+          set -euo pipefail
+          for src in ${{ steps.select.outputs.dirs }}; do
+            echo "==> Build ${src}"
+            cmake --build "${src}/build" --parallel
+          done
+      - name: Test
+        run: |
+          set -euo pipefail
+          for src in ${{ steps.select.outputs.dirs }}; do
+            echo "==> Test ${src}"
+            ctest --test-dir "${src}/build" --output-on-failure
+          done
+      - name: Package
+        run: |
+          set -euo pipefail
+          for src in ${{ steps.select.outputs.dirs }}; do
+            echo "==> Package ${src}"
+            cmake --build "${src}/build" --target package
+          done
+      - name: Release
+        if: github.ref == 'refs/heads/master'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./helloworld-0.0.${{ github.run_number }}-Linux.deb
-          asset_name: helloworld-0.0.${{ github.run_number }}-Linux.deb
-          asset_content_type: application/vnd.debian.binary-package
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.run_number }}"
+          mapfile -t debs < <(find . -type f -name '*.deb' -not -path '*/_CPack_Packages/*' | sort)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "::warning::No .deb packages built, release skipped"
+            exit 0
+          fi
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${debs[@]}" --clobber
+          else
+            gh release create "${tag}" "${debs[@]}" --title "Release ${tag}" --target '${{ github.sha }}'
+          fi
+          echo "Released assets:"
+          printf '  %s\n' "${debs[@]}"
